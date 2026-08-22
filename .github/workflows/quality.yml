@@ -1,0 +1,17 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell scripts
+        run: sh -n scripts/*.sh
+      - name: Check Python
+        run: python3 -m py_compile src/codex_provider_switcher.py
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v

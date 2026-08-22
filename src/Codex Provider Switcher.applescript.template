@@ -1,0 +1,62 @@
+property helper : "__HELPER_PATH__"
+
+on splitText(theText, theDelimiter)
+    set oldDelimiters to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to theDelimiter
+    set pieces to text items of theText
+    set AppleScript's text item delimiters to oldDelimiters
+    return pieces
+end splitText
+
+on chooseCodexAccount()
+    set rawRows to paragraphs of (do shell script helper & " prepare-accounts")
+    set displayRows to {}
+    repeat with rawRow in rawRows
+        set fields to my splitText(rawRow as text, tab)
+        if (count of fields) ≥ 2 then set end of displayRows to item 2 of fields
+    end repeat
+    if (count of displayRows) is less than 2 then error "Не удалось найти авторизованные подписки Codex."
+    set picked to choose from list displayRows with title "Codex" with prompt "Выберите аккаунт:" OK button name "Войти" cancel button name "Отмена"
+    if picked is false then return
+    set pickedLabel to item 1 of picked
+    repeat with rawRow in rawRows
+        set fields to my splitText(rawRow as text, tab)
+        if (count of fields) ≥ 2 and (item 2 of fields) is pickedLabel then
+            do shell script helper & " switch-account " & quoted form of (item 1 of fields)
+            exit repeat
+        end if
+    end repeat
+end chooseCodexAccount
+
+on chooseProvider()
+    set rawRows to paragraphs of (do shell script helper & " list-providers")
+    set displayRows to {}
+    repeat with rawRow in rawRows
+        set fields to my splitText(rawRow as text, tab)
+        if (count of fields) ≥ 2 then set end of displayRows to item 2 of fields
+    end repeat
+    if (count of displayRows) is 0 then error "Провайдеры не найдены."
+    set picked to choose from list displayRows with title "Codex Provider Switcher" with prompt "Что переключить:" default items {item 1 of displayRows} OK button name "Выбрать" cancel button name "Отмена"
+    if picked is false then return
+    set pickedLabel to item 1 of picked
+    repeat with rawRow in rawRows
+        set fields to my splitText(rawRow as text, tab)
+        if (count of fields) ≥ 2 and (item 2 of fields) is pickedLabel then
+            set providerKey to item 1 of fields
+            if providerKey is "openai" then
+                my chooseCodexAccount()
+            else
+                do shell script helper & " switch-provider " & quoted form of providerKey
+            end if
+            exit repeat
+        end if
+    end repeat
+end chooseProvider
+
+on run
+    try
+        my chooseProvider()
+    on error errorMessage
+        display dialog errorMessage with title "Codex Provider Switcher — ошибка" buttons {"OK"} default button "OK"
+    end try
+end run
