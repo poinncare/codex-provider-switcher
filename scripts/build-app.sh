@@ -19,6 +19,14 @@ rm -rf "$app_path"
 helper_literal=$(printf '%s' "$helper_path" | sed 's/[\\&|]/\\&/g')
 sed "s|__HELPER_PATH__|$helper_literal|g" "$template_path" > "$rendered_script"
 /usr/bin/osacompile -o "$app_path" "$rendered_script" >/dev/null
+
+# Reuse the Codex icon shipped with the official ChatGPT desktop app when it
+# is installed. Independent installations keep the AppleScript default icon.
+codex_icon_source="/Applications/ChatGPT.app/Contents/Resources/app.icns"
+if [ -f "$codex_icon_source" ]; then
+    cp "$codex_icon_source" "$app_path/Contents/Resources/applet.icns"
+fi
+
 chmod +x "$helper_path"
 /usr/bin/codesign --force --deep --sign - "$app_path" >/dev/null 2>&1 || true
 
