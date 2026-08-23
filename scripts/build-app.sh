@@ -2,7 +2,7 @@
 set -eu
 
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-app_path="$root_dir/dist/Codex Provider Switcher.app"
+app_path="$root_dir/dist/Codex.app"
 template_path="$root_dir/src/Codex Provider Switcher.applescript.template"
 helper_path="$root_dir/src/codex_provider_switcher.py"
 tmp_dir=$(printenv TMPDIR 2>/dev/null || printf '/tmp')

@@ -36,7 +36,7 @@ on chooseProvider()
         if (count of fields) ≥ 2 then set end of displayRows to item 2 of fields
     end repeat
     if (count of displayRows) is 0 then error "Провайдеры не найдены."
-    set picked to choose from list displayRows with title "Codex Provider Switcher" with prompt "Что переключить:" default items {item 1 of displayRows} OK button name "Выбрать" cancel button name "Отмена"
+    set picked to choose from list displayRows with title "Codex" with prompt "Что переключить:" default items {item 1 of displayRows} OK button name "Выбрать" cancel button name "Отмена"
     if picked is false then return
     set pickedLabel to item 1 of picked
     repeat with rawRow in rawRows
@@ -57,6 +57,6 @@ on run
     try
         my chooseProvider()
     on error errorMessage
-        display dialog errorMessage with title "Codex Provider Switcher — ошибка" buttons {"OK"} default button "OK"
+        display dialog errorMessage with title "Codex — ошибка" buttons {"OK"} default button "OK"
     end try
 end run
