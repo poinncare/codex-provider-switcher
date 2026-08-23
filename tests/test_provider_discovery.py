@@ -2,6 +2,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -49,6 +50,27 @@ class ProviderDiscoveryTests(unittest.TestCase):
         self.assertNotIn("/Users/", source)
         self.assertNotIn("sk-or-", source)
         self.assertNotIn("@gmail.com", source)
+
+    def test_native_launch_drops_managed_runtime_context(self):
+        with patch.dict(
+            MODULE.os.environ,
+            {
+                "CODEX_HOME": "/tmp/managed-codex",
+                "ORCA_CODEX_HOME": "/tmp/managed-codex",
+                "OPENCODE_CONFIG_DIR": "/tmp/orca-opencode",
+                "PATH": "/tmp/managed-codex/bin:/usr/bin",
+            },
+            clear=False,
+        ):
+            environment = MODULE.launch_environment()
+
+        self.assertNotIn("CODEX_HOME", environment)
+        self.assertNotIn("ORCA_CODEX_HOME", environment)
+        self.assertNotIn("OPENCODE_CONFIG_DIR", environment)
+        self.assertEqual(
+            environment["PATH"],
+            "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin",
+        )
 
 
 if __name__ == "__main__":

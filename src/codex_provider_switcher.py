@@ -18,6 +18,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HOME = Path.home()
+NATIVE_CODEX_HOME = HOME / ".codex"
+NATIVE_AUTH_PATH = NATIVE_CODEX_HOME / "auth.json"
+NATIVE_CONFIG_PATH = NATIVE_CODEX_HOME / "config.toml"
 ORCA_USER_DATA = Path(
     os.environ.get("ORCA_USER_DATA_PATH", HOME / "Library/Application Support/orca")
 ).expanduser()
@@ -26,7 +29,6 @@ ORCA_DATA_PATHS = [
     ORCA_USER_DATA / "orca-data.json",
     ORCA_USER_DATA / "profiles/local-default/orca-data.json",
 ]
-PANE_ACCOUNTS_PATH = ORCA_USER_DATA / "codex-pane-accounts.json"
 OPENROUTER_TOKEN_HELPER = PROJECT_ROOT / "scripts/openrouter-token.sh"
 SWITCHER_STATE_PATH = Path(
     os.environ.get("CODEX_PROVIDER_SWITCHER_STATE", HOME / ".codex/codex-provider-switcher-state.json")
@@ -138,7 +140,7 @@ def opencode_provider(provider_key: str) -> dict | None:
 
 
 def local_system_account() -> dict:
-    auth_path = HOME / ".codex/auth.json"
+    auth_path = NATIVE_AUTH_PATH
     try:
         data = json.loads(auth_path.read_text(encoding="utf-8"))
         tokens = data.get("tokens", {})
@@ -154,6 +156,67 @@ def local_system_account() -> dict:
     except (OSError, IndexError, KeyError, ValueError, json.JSONDecodeError):
         pass
     return {}
+
+
+def auth_account_id(path: Path = NATIVE_AUTH_PATH) -> str | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        account_id = data.get("tokens", {}).get("account_id")
+        return str(account_id) if account_id else None
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+
+
+def managed_account_for_auth_id(auth_id: str | None) -> dict | None:
+    if not auth_id:
+        return None
+    return next(
+        (
+            account
+            for account in managed_accounts()
+            if auth_id in {account.get("id"), account.get("providerAccountId")}
+        ),
+        None,
+    )
+
+
+def backup_and_copy(source: Path, target: Path) -> Path | None:
+    backup = None
+    if target.is_file():
+        backup = target.with_name(
+            target.name + "." + datetime.now().strftime("%Y%m%d-%H%M%S") + ".bak"
+        )
+        shutil.copy2(target, backup)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    target.chmod(0o600)
+    return backup
+
+
+def switch_native_auth(account_id: str) -> None:
+    selected = next(
+        (account for account in managed_accounts() if account.get("id") == account_id),
+        None,
+    )
+    if not selected:
+        raise RuntimeError("Этот аккаунт ещё не зарегистрирован в Orca.")
+
+    target_home = Path(selected.get("managedHomePath") or ACCOUNTS_ROOT / account_id / "home")
+    target_auth = target_home / "auth.json"
+    if not target_auth.is_file():
+        raise RuntimeError("Для выбранного аккаунта не найдена сохранённая Codex-сессия.")
+
+    current = managed_account_for_auth_id(auth_account_id())
+    if current and current.get("id") != account_id:
+        current_home = Path(
+            current.get("managedHomePath")
+            or ACCOUNTS_ROOT / str(current.get("id")) / "home"
+        )
+        current_auth = current_home / "auth.json"
+        if current_auth.is_file():
+            backup_and_copy(NATIVE_AUTH_PATH, current_auth)
+
+    backup_and_copy(target_auth, NATIVE_AUTH_PATH)
 
 
 def orca_accounts() -> dict:
@@ -396,6 +459,8 @@ def launch_environment(account_home: Path | None = None) -> dict[str, str]:
             "CODEX_THREAD_ID",
             "ORCA_PANE_KEY",
             "ORCA_TERMINAL_HANDLE",
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_DIR",
             "TERM_PROGRAM",
             "TERM_PROGRAM_VERSION",
         }:
@@ -404,6 +469,10 @@ def launch_environment(account_home: Path | None = None) -> dict[str, str]:
         env["CODEX_HOME"] = str(account_home)
         env["ORCA_CODEX_HOME"] = str(account_home)
         env["ORCA_USER_DATA_PATH"] = str(ORCA_USER_DATA)
+    else:
+        # Orca can inject a managed-home path into PATH.  A native ChatGPT
+        # launch must not inherit that runtime context.
+        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
     return env
 
 
@@ -512,7 +581,9 @@ def list_provider_rows() -> None:
 
 
 def switch_provider(provider_key: str, model: str | None) -> None:
-    config = config_for_account()
+    config = NATIVE_CONFIG_PATH
+    if not config.is_file():
+        raise RuntimeError("Не найден штатный конфиг Codex в ~/.codex.")
     original = config.read_text(encoding="utf-8")
     previous_provider = root_value(original, "model_provider")
     previous_model = root_value(original, "model")
@@ -536,7 +607,7 @@ def switch_provider(provider_key: str, model: str | None) -> None:
     updated = set_root_key(updated, "model", selected_model)
     backup_and_write(config, updated)
     remember_model(provider, selected_model)
-    open_apps(["ChatGPT"], config.parent)
+    open_apps(["ChatGPT"])
 
 
 def list_model_rows(provider_key: str) -> None:
@@ -651,35 +722,19 @@ def select_account(account_id: str) -> None:
     if account_id not in accounts:
         raise RuntimeError("Этот аккаунт ещё не зарегистрирован в Orca.")
 
-    stop_apps(["ChatGPT", "Orca"])
+    stop_apps(["ChatGPT"])
     stop_desktop_codex_server()
+    switch_native_auth(account_id)
 
-    def update_orca_data(data: dict) -> dict:
-        settings = data.setdefault("settings", {})
-        settings["activeCodexManagedAccountId"] = account_id
-        runtime_selection = settings.setdefault("activeCodexManagedAccountIdsByRuntime", {})
-        runtime_selection["host"] = account_id
-        runtime_selection.setdefault("wsl", {})
-        return data
-
-    for path in ORCA_DATA_PATHS:
-        replace_json_with_backup(path, update_orca_data)
-
-    def update_panes(data: dict) -> dict:
-        for pane in data.get("panes", {}).values():
-            pane["accountId"] = account_id
-            pane["homeRoute"] = "account-home"
-        return data
-
-    replace_json_with_backup(PANE_ACCOUNTS_PATH, update_panes)
-    target_config = config_for_account(account_id)
-    original = target_config.read_text(encoding="utf-8")
+    if not NATIVE_CONFIG_PATH.is_file():
+        raise RuntimeError("Не найден штатный конфиг Codex в ~/.codex.")
+    original = NATIVE_CONFIG_PATH.read_text(encoding="utf-8")
     updated = ensure_external_provider_tables(original)
     updated = set_root_key(updated, "model_provider", "openai")
     updated = set_root_key(updated, "model", "gpt-5.6-luna")
     if updated != original:
-        backup_and_write(target_config, updated)
-    open_apps(["Orca", "ChatGPT"], target_config.parent)
+        backup_and_write(NATIVE_CONFIG_PATH, updated)
+    open_apps(["ChatGPT"])
 
 
 def main() -> int:
