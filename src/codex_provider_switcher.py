@@ -207,14 +207,19 @@ def switch_native_auth(account_id: str) -> None:
         raise RuntimeError("Для выбранного аккаунта не найдена сохранённая Codex-сессия.")
 
     current = managed_account_for_auth_id(auth_account_id())
-    if current and current.get("id") != account_id:
+    if current and current.get("id") == account_id:
+        # Codex refreshes OAuth tokens in the native auth file while it is
+        # running.  Re-copying the managed snapshot for the already-active
+        # account would roll those tokens back and can force a new login.
+        return
+
+    if current:
         current_home = Path(
             current.get("managedHomePath")
             or ACCOUNTS_ROOT / str(current.get("id")) / "home"
         )
         current_auth = current_home / "auth.json"
-        if current_auth.is_file():
-            backup_and_copy(NATIVE_AUTH_PATH, current_auth)
+        backup_and_copy(NATIVE_AUTH_PATH, current_auth)
 
     backup_and_copy(target_auth, NATIVE_AUTH_PATH)
 
