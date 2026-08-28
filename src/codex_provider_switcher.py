@@ -97,6 +97,26 @@ def load_jsonc(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def opencode_provider_auth(provider: dict) -> str | None:
+    options = provider.get("options") or {}
+    api_key = options.get("apiKey") or options.get("api_key")
+    if isinstance(api_key, str) and api_key and not api_key.startswith("$"):
+        return api_key
+    env = options.get("env", options.get("envs"))
+    if isinstance(env, dict):
+        for key in ("API_KEY", "OPENAI_API_KEY", "api_key", "apiKey"):
+            if key in env:
+                env = env[key]
+                break
+        else:
+            env = None
+    if isinstance(env, str):
+        if env.startswith("$"):
+            env = env[1:]
+        return os.environ.get(env)
+    return None
+
+
 def opencode_provider_configs() -> list[dict]:
     for path in jsonc_paths():
         if not path.is_file():
@@ -114,23 +134,25 @@ def opencode_provider_configs() -> list[dict]:
                 continue
             options = provider.get("options") or {}
             base_url = options.get("baseURL") or options.get("base_url") or provider.get("baseURL")
-            models = provider.get("models") or {}
-            if not base_url or not isinstance(models, dict):
+            if not base_url:
                 continue
+            models = provider.get("models") or {}
             model_rows = []
-            for model_id, model in models.items():
-                display_name = model.get("name") if isinstance(model, dict) else None
-                model_rows.append((str(model_id), str(display_name or model_id)))
-            if model_rows:
-                discovered.append(
-                    {
-                        "id": str(provider_id),
-                        "key": "opencode-" + re.sub(r"[^A-Za-z0-9_-]", "-", str(provider_id)),
-                        "name": str(provider.get("name") or provider_id),
-                        "base_url": str(base_url),
-                        "models": model_rows,
-                    }
-                )
+            if isinstance(models, dict):
+                for model_id, model in models.items():
+                    display_name = model.get("name") if isinstance(model, dict) else None
+                    model_rows.append((str(model_id), str(display_name or model_id)))
+            discovered.append(
+                {
+                    "id": str(provider_id),
+                    "key": "opencode-" + re.sub(r"[^A-Za-z0-9_-]", "-", str(provider_id)),
+                    "name": str(provider.get("name") or provider_id),
+                    "base_url": str(base_url),
+                    "models": model_rows,
+                    "api_key": opencode_provider_auth(provider),
+                    "_options": options,
+                }
+            )
         return discovered
     return []
 
@@ -356,16 +378,20 @@ def provider_tables() -> str:
         OPENROUTER_PROVIDER_TABLE.format(token_helper=toml_string(str(OPENROUTER_TOKEN_HELPER)))
     ]
     for provider in opencode_provider_configs():
-        blocks.append(
-            "\n".join(
-                [
-                    f"[model_providers.{provider['key']}]",
-                    f"name = {toml_string('OpenCode · ' + provider['name'])}",
-                    f"base_url = {toml_string(provider['base_url'])}",
-                    'wire_api = "responses"',
-                ]
-            )
-        )
+        options = (provider.get("_options") or {})
+        wire_api = options.get("wireApi") or options.get("wire_api") or "chat"
+        lines = [
+            f"[model_providers.{provider['key']}]",
+            f"name = {toml_string('OpenCode · ' + provider['name'])}",
+            f"base_url = {toml_string(provider['base_url'])}",
+            f'wire_api = {toml_string(wire_api)}',
+        ]
+        api_key = provider.get("api_key")
+        if api_key:
+            lines.append("")
+            lines.append(f"[model_providers.{provider['key']}.auth]")
+            lines.append(f"api_key = {toml_string(api_key)}")
+        blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
 
@@ -389,10 +415,24 @@ def ensure_external_provider_tables(text: str) -> str:
     for provider in opencode_provider_configs():
         marker = f"[model_providers.{provider['key']}]"
         if marker not in text:
-            text = text.rstrip() + "\n\n" + next(
-                block for block in tables.split("\n\n") if block.startswith(marker)
-            )
+            text = text.rstrip() + "\n\n" + provider_block_for(tables, marker)
     return text.rstrip() + "\n"
+
+
+def provider_block_for(tables: str, marker: str) -> str:
+    paragraphs = tables.split("\n\n")
+    key = marker[len("[model_providers.") : -1]
+    base = "[model_providers." + key
+    for index, block in enumerate(paragraphs):
+        if block.startswith(base + "]") or block.startswith(base + "."):
+            chunk = [block]
+            for following in paragraphs[index + 1 :]:
+                belongs = following.startswith(base + "]") or following.startswith(base + ".")
+                if following.startswith("[model_providers.") and not belongs:
+                    break
+                chunk.append(following)
+            return "\n\n".join(chunk)
+    return ""
 
 
 def backup_and_write(path: Path, text: str) -> Path:
@@ -562,12 +602,37 @@ def fetch_openrouter_free_models() -> list[tuple[str, str]]:
         return fallback
 
 
+def fetch_opencode_models(base_url: str) -> list[tuple[str, str]]:
+    try:
+        models_url = base_url.rstrip("/") + "/models"
+        with urllib.request.urlopen(models_url, timeout=3) as response:
+            payload = json.load(response)
+        if not isinstance(payload.get("data"), list):
+            return []
+        models = []
+        for entry in payload["data"]:
+            if not isinstance(entry, dict):
+                continue
+            model_id = str(entry.get("id") or entry.get("name") or "")
+            if model_id:
+                models.append((model_id, entry.get("name") or model_id))
+        return models
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
+        return []
+
+
 def models_for(provider_key: str) -> list[tuple[str, str]]:
     if provider_key == "openrouter-free":
         return fetch_openrouter_free_models()
     provider = opencode_provider(provider_key)
     if provider:
-        return provider["models"]
+        # Prefer the curated models declared in opencode.jsonc (the user's
+        # free list).  If none are declared, fall back to whatever the live
+        # OpenCode gateway exposes so the provider still works.
+        models = provider.get("models") or []
+        if not models:
+            models = fetch_opencode_models(provider["base_url"])
+        return models
     return [("gpt-5.6-luna", "GPT-5.6 Luna — лимит подписки")]
 
 

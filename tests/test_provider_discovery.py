@@ -45,6 +45,96 @@ class ProviderDiscoveryTests(unittest.TestCase):
         self.assertEqual(providers[0]["key"], "opencode-example")
         self.assertEqual(providers[0]["models"], [("example/free-model", "Free Model")])
 
+    def test_provider_without_static_models_is_still_discovered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "opencode.jsonc"
+            config.write_text(
+                """
+                {
+                  "provider": {
+                    "local": {
+                      "name": "Local Gateway",
+                      "options": { "baseURL": "http://127.0.0.1:20128/v1" },
+                    },
+                  },
+                }
+                """,
+                encoding="utf-8",
+            )
+            original = MODULE.jsonc_paths
+            MODULE.jsonc_paths = lambda: [config]
+            try:
+                providers = MODULE.opencode_provider_configs()
+            finally:
+                MODULE.jsonc_paths = original
+
+        self.assertEqual(len(providers), 1)
+        self.assertEqual(providers[0]["key"], "opencode-local")
+        self.assertEqual(providers[0]["models"], [])
+
+    def test_provider_api_key_is_extracted_from_options(self):
+        provider = {
+            "name": "Local Gateway",
+            "options": {"baseURL": "http://127.0.0.1:20128/v1", "apiKey": "secret-key"},
+        }
+        self.assertEqual(MODULE.opencode_provider_auth(provider), "secret-key")
+
+    def test_provider_block_includes_auth_subsection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "opencode.jsonc"
+            config.write_text(
+                """
+                {
+                  "provider": {
+                    "local": {
+                      "name": "Local Gateway",
+                      "options": { "baseURL": "http://127.0.0.1:20128/v1", "apiKey": "secret-key" },
+                    },
+                  },
+                }
+                """,
+                encoding="utf-8",
+            )
+            original = MODULE.jsonc_paths
+            MODULE.jsonc_paths = lambda: [config]
+            try:
+                tables = MODULE.provider_tables()
+            finally:
+                MODULE.jsonc_paths = original
+
+        self.assertIn("[model_providers.opencode-local]", tables)
+        self.assertIn('api_key = "secret-key"', tables)
+        block = MODULE.provider_block_for(tables, "[model_providers.opencode-local]")
+        self.assertIn('api_key = "secret-key"', block)
+
+    def test_opencode_falls_back_to_gateway_when_no_static_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "opencode.jsonc"
+            config.write_text(
+                """
+                {
+                  "provider": {
+                    "local": {
+                      "name": "Local Gateway",
+                      "options": { "baseURL": "http://127.0.0.1:20128/v1" },
+                    },
+                  },
+                }
+                """,
+                encoding="utf-8",
+            )
+            original_paths = MODULE.jsonc_paths
+            original_fetch = MODULE.fetch_opencode_models
+            MODULE.jsonc_paths = lambda: [config]
+            MODULE.fetch_opencode_models = lambda base_url: [("local/model-a", "Model A")]
+            try:
+                models = MODULE.models_for("opencode-local")
+            finally:
+                MODULE.jsonc_paths = original_paths
+                MODULE.fetch_opencode_models = original_fetch
+
+        self.assertEqual(models, [("local/model-a", "Model A")])
+
     def test_local_paths_are_not_embedded_in_source(self):
         source = SOURCE.read_text(encoding="utf-8")
         self.assertNotIn("/Users/", source)
