@@ -50,18 +50,59 @@ timeout_ms = 5000
 refresh_interval_ms = 0
 """
 
-OPENCODE_CONFIG_NAMES = ("opencode.json", "opencode.jsonc")
-# Providers that must never appear as separate launcher entries.  Copilot is
-# not used by this project, so a provider that identifies itself as Copilot is
-# skipped during discovery.  Copilot models exposed by another provider (for
-# example through the shared OpenCode gateway) are left untouched.
-EXCLUDED_OPENCODE_PROVIDER_MARKER = "copilot"
+# Providers the launcher registers in Codex.  Codex and OpenRouter are fixed
+# entries; "OpenCode" is one entry that mirrors every model OpenCode itself
+# offers.  OpenCode spreads those models over several upstreams with their own
+# endpoints and credentials, so a small loopback router (see
+# src/opencode_router.py) sits between Codex and OpenCode and forwards each
+# request to the upstream OpenCode configured for that model.
+OPENCODE_PROVIDER_KEY = "opencode"
+OPENCODE_PROVIDER_NAME = "OpenCode"
+OPENCODE_ROUTER_MODULE = PROJECT_ROOT / "src/opencode_router.py"
+OPENCODE_ROUTER_HOST = "127.0.0.1"
+OPENCODE_ROUTER_PORT = 20130
+OPENCODE_ROUTER_SERVICE = "codex-provider-switcher-router"
+OPENCODE_ROUTER_STATE_PATH = NATIVE_CODEX_HOME / "codex-provider-switcher-router.json"
+OPENCODE_ROUTER_LOG_PATH = NATIVE_CODEX_HOME / "codex-provider-switcher-router.log"
+OPENCODE_ROUTER_READY_TIMEOUT = 30.0
+# OpenCode's own state: where its background service listens and which models
+# were used last.  Both are read-only inputs for the launcher.
+OPENCODE_STATE_DIR = Path(
+    os.environ.get("XDG_STATE_HOME") or HOME / ".local/state"
+).expanduser() / "opencode"
+OPENCODE_SERVICE_PATH = OPENCODE_STATE_DIR / "service.json"
+OPENCODE_CLI_CANDIDATES = (
+    os.environ.get("OPENCODE_CLI_COMMAND"),
+    HOME / ".opencode/bin/opencode",
+    "/opt/homebrew/bin/opencode",
+    "/usr/local/bin/opencode",
+)
 # Provider ids owned by the launcher.  These are the only sections the launcher
-# creates, refreshes and removes in Codex config.toml.
-MANAGED_PROVIDER_KEYS = ("openrouter",)
+# creates, refreshes and removes in Codex config.toml.  The `opencode-` prefix
+# is kept so tables written by earlier releases are still cleaned up.
+MANAGED_PROVIDER_KEYS = ("openrouter", OPENCODE_PROVIDER_KEY)
 MANAGED_PROVIDER_PREFIX = "opencode-"
 # Comment written above the launcher-managed provider section.
 EXTERNAL_PROVIDERS_MARKER = "# External model providers"
+# Codex replaces its entire model picker with whatever catalog this root config
+# key points at, and that is the only way to make it list models it does not
+# ship itself.  The launcher rewrites the catalog from the model list OpenCode
+# itself reports on every switch, so Codex and OpenCode always offer the same
+# list.  The key exists only while OpenCode is selected and is removed again for
+# Codex/OpenRouter.
+MODEL_CATALOG_ENV = "CODEX_MODEL_CATALOG_JSON"
+MODEL_CATALOG_FILENAME = "codex-provider-switcher-models.json"
+MODEL_CATALOG_ROOT_KEY = "model_catalog_json"
+# Used when a provider reports no context length for a model.
+DEFAULT_CATALOG_CONTEXT_WINDOW = 200000
+# Codex rejects catalog entries without model instructions.  Reusing the prompt
+# Codex already caches for its own models keeps third-party models behaving like
+# first-party ones; this short text is only used when no cache exists yet.
+FALLBACK_MODEL_INSTRUCTIONS = (
+    "You are Codex, an agent working in the user's workspace. Use the provided "
+    "tools to inspect the repository, run commands and make edits, then report "
+    "what you changed."
+)
 
 
 def run_json(command: list[str]) -> dict:
@@ -97,108 +138,65 @@ def codex_command() -> str | None:
     return None
 
 
-def jsonc_paths() -> list[Path]:
-    paths = []
-    configured = os.environ.get("OPENCODE_CONFIG")
-    config_dir = os.environ.get("OPENCODE_CONFIG_DIR")
-    if configured:
-        paths.append(Path(configured).expanduser())
-    if config_dir:
-        paths.extend(Path(config_dir).expanduser() / name for name in OPENCODE_CONFIG_NAMES)
-    paths.extend(
-        [
-            HOME / ".config/opencode/opencode.json",
-            HOME / ".config/opencode/opencode.jsonc",
-            HOME / "Library/Application Support/opencode/opencode.json",
-            HOME / "Library/Application Support/opencode/opencode.jsonc",
-        ]
-    )
-    return list(dict.fromkeys(paths))
-
-
-def load_jsonc(path: Path) -> dict:
-    text = path.read_text(encoding="utf-8")
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    text = re.sub(r"(^|\s)//.*$", r"\1", text, flags=re.M)
-    text = re.sub(r",\s*([}\]])", r"\1", text)
-    value = json.loads(text)
-    return value if isinstance(value, dict) else {}
-
-
-def opencode_provider_auth(provider: dict) -> str | None:
-    options = provider.get("options") or {}
-    api_key = options.get("apiKey") or options.get("api_key")
-    if isinstance(api_key, str) and api_key and not api_key.startswith("$"):
-        return api_key
-    env = options.get("env", options.get("envs"))
-    if isinstance(env, dict):
-        for key in ("API_KEY", "OPENAI_API_KEY", "api_key", "apiKey"):
-            if key in env:
-                env = env[key]
-                break
-        else:
-            env = None
-    if isinstance(env, str):
-        if env.startswith("$"):
-            env = env[1:]
-        return os.environ.get(env)
-    return None
-
-
-def is_excluded_provider(provider_id: str, provider_name: str) -> bool:
-    haystack = f"{provider_id} {provider_name}".lower()
-    return EXCLUDED_OPENCODE_PROVIDER_MARKER in haystack
-
-
-def is_managed_provider_key(key: str) -> bool:
-    """True when the launcher owns this [model_providers.*] section."""
-    return key in MANAGED_PROVIDER_KEYS or key.startswith(MANAGED_PROVIDER_PREFIX)
-
-
-def opencode_provider_configs() -> list[dict]:
-    for path in jsonc_paths():
-        if not path.is_file():
+def opencode_cli_path() -> str | None:
+    """Path to the OpenCode CLI, used to wake its background service."""
+    for candidate in OPENCODE_CLI_CANDIDATES:
+        if not candidate:
             continue
+        path = Path(candidate).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return shutil.which("opencode")
+
+
+def opencode_service_info() -> dict | None:
+    """URL and password of the running OpenCode service, if it is alive."""
+    try:
+        payload = json.loads(OPENCODE_SERVICE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    url = payload.get("url")
+    pid = payload.get("pid")
+    if not isinstance(url, str) or not url:
+        return None
+    if isinstance(pid, int):
         try:
-            data = load_jsonc(path)
-        except (OSError, json.JSONDecodeError):
-            continue
-        providers = data.get("provider") or data.get("providers") or {}
-        if not isinstance(providers, dict):
-            continue
-        discovered = []
-        for provider_id, provider in providers.items():
-            if not isinstance(provider, dict):
-                continue
-            options = provider.get("options") or {}
-            base_url = options.get("baseURL") or options.get("base_url") or provider.get("baseURL")
-            if not base_url:
-                continue
-            if is_excluded_provider(str(provider_id), str(provider.get("name") or provider_id)):
-                continue
-            models = provider.get("models") or {}
-            model_rows = []
-            if isinstance(models, dict):
-                for model_id, model in models.items():
-                    display_name = model.get("name") if isinstance(model, dict) else None
-                    model_rows.append((str(model_id), str(display_name or model_id)))
-            discovered.append(
-                {
-                    "id": str(provider_id),
-                    "key": MANAGED_PROVIDER_PREFIX
-                    + re.sub(r"[^A-Za-z0-9_-]", "-", str(provider_id)),
-                    "name": str(provider.get("name") or provider_id),
-                    "base_url": str(base_url),
-                    "models": model_rows,
-                    "api_key": opencode_provider_auth(provider),
-                }
-            )
-        return discovered
-    return []
+            os.kill(pid, 0)
+        except OSError:
+            # A stale state file survives a crashed service; its pid is gone.
+            return None
+    return {"url": url.rstrip("/"), "password": str(payload.get("password") or "")}
 
 
-def opencode_provider(provider_key: str) -> dict | None:
-    return next((item for item in opencode_provider_configs() if item["key"] == provider_key), None)
+def opencode_service_ready() -> bool:
+    info = opencode_service_info()
+    if not info:
+        return False
+    request = urllib.request.Request(info["url"] + "/api/info")
+    token = base64.b64encode(f"opencode:{info['password']}".encode()).decode()
+    request.add_header("Authorization", f"Basic {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def ensure_opencode_service() -> None:
+    """Wake OpenCode's background service, which answers the model list.
+
+    The service starts on demand when the CLI runs; running `opencode models`
+    is the cheapest way to trigger that without opening a window.
+    """
+    if opencode_service_ready():
+        return
+    cli = opencode_cli_path()
+    if not cli:
+        return
+    try:
+        subprocess.run([cli, "models"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def account_from_auth(auth_path: Path) -> dict:
@@ -394,6 +392,15 @@ def root_value(text: str, key: str) -> str | None:
     return match.group(1) if match else None
 
 
+def remove_root_key(text: str, key: str) -> str:
+    """Drop a top-level key so a stale value cannot survive a switch."""
+    first_table = re.search(r"(?m)^\s*\[", text)
+    split_at = first_table.start() if first_table else len(text)
+    root, tables = text[:split_at], text[split_at:]
+    root = re.sub(rf"(?m)^\s*{re.escape(key)}\s*=.*\n?", "", root)
+    return root + tables
+
+
 def load_switcher_state() -> dict:
     try:
         data = json.loads(SWITCHER_STATE_PATH.read_text(encoding="utf-8"))
@@ -414,18 +421,19 @@ def remember_model(provider: str | None, model: str | None) -> None:
     save_switcher_state(state)
 
 
-def default_model_for(provider_key: str, current_config: str) -> str:
+def default_model_for(provider_key: str, current_config: str, available: list[str]) -> str:
     provider = {"openrouter-free": "openrouter"}.get(provider_key, provider_key)
     current_provider = root_value(current_config, "model_provider")
     current_model = root_value(current_config, "model")
-    if current_provider == provider and current_model:
+    # The model is picked later inside the Codex interface, so the switcher only
+    # needs a valid starting point.  Prefer whatever the provider currently
+    # advertises instead of a hard-coded list that goes stale, and never keep a
+    # model that belongs to a previous provider (for example a bundled Codex
+    # model left over from before the switch).
+    if current_provider == provider and current_model in available:
         return current_model
-    # The model is picked later inside the Codex interface, so the switcher
-    # only needs a valid starting point.  Prefer whatever the provider
-    # currently advertises instead of a hard-coded list that goes stale.
-    available = models_for(provider_key)
     if available:
-        return available[0][0]
+        return available[0]
     state_model = load_switcher_state().get("last_models", {}).get(provider)
     if state_model:
         return state_model
@@ -436,27 +444,32 @@ def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def provider_tables() -> str:
+def provider_tables(opencode: dict | None = None) -> str:
     blocks = [
         OPENROUTER_PROVIDER_TABLE.format(token_helper=toml_string(str(OPENROUTER_TOKEN_HELPER)))
     ]
-    for provider in opencode_provider_configs():
+    if opencode:
         # Codex only supports the Responses wire API; the legacy "chat" value is
-        # rejected outright.  OpenCode gateways speak the OpenAI-compatible
-        # Responses API, so every generated provider uses it.
+        # rejected outright.  The router speaks Responses and translates nothing,
+        # it just forwards to the upstream OpenCode configured per model.
         lines = [
-            f"[model_providers.{provider['key']}]",
-            f"name = {toml_string(provider['name'])}",
-            f"base_url = {toml_string(provider['base_url'])}",
+            f"[model_providers.{opencode['key']}]",
+            f"name = {toml_string(opencode['name'])}",
+            f"base_url = {toml_string(opencode['base_url'])}",
             'wire_api = "responses"',
         ]
-        api_key = provider.get("api_key")
+        api_key = opencode.get("api_key")
         if api_key:
             # Codex's ModelProviderInfo denies unknown fields inside [.auth], so
             # a static bearer key belongs at provider level.
             lines.append(f"experimental_bearer_token = {toml_string(api_key)}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
+
+
+def is_managed_provider_key(key: str) -> bool:
+    """True when the launcher owns this [model_providers.*] section."""
+    return key in MANAGED_PROVIDER_KEYS or key.startswith(MANAGED_PROVIDER_PREFIX)
 
 
 def strip_managed_provider_tables(text: str) -> str:
@@ -487,9 +500,9 @@ def strip_managed_provider_tables(text: str) -> str:
     return result + "\n" if result else ""
 
 
-def ensure_external_provider_tables(text: str) -> str:
+def ensure_external_provider_tables(text: str, opencode: dict | None = None) -> str:
     stripped = strip_managed_provider_tables(text).rstrip()
-    tables = provider_tables()
+    tables = provider_tables(opencode)
     if not tables:
         return stripped + "\n" if stripped else ""
     prefix = stripped + "\n\n" if stripped else ""
@@ -589,39 +602,164 @@ def open_apps(apps: list[str], account_home: Path | None = None) -> None:
         time.sleep(1)
 
 
-def opencode_gateway_ready() -> bool:
+def opencode_router_base() -> str:
+    return f"http://{OPENCODE_ROUTER_HOST}:{OPENCODE_ROUTER_PORT}"
+
+
+def opencode_router_source_stamp() -> str:
+    """Timestamp of the router source the launcher expects to be running.
+
+    A long-lived daemon would otherwise keep serving old code after an update,
+    so a mismatch restarts it instead of silently mixing versions.
+    """
     try:
-        with urllib.request.urlopen("http://127.0.0.1:20128/v1/models", timeout=2) as response:
-            payload = json.load(response)
-            return response.status == 200 and isinstance(payload.get("data"), list)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
-        return False
+        return str(int(OPENCODE_ROUTER_MODULE.stat().st_mtime))
+    except OSError:
+        return ""
 
 
-def require_opencode_gateway() -> None:
-    if not opencode_gateway_ready():
-        raise RuntimeError(
-            "Не найден OpenAI-compatible OpenCode gateway на localhost:20128. "
-            "Запустите ваш gateway из OpenCode; обычная команда `opencode serve` для Codex не подходит."
-        )
-
-
-def opencode_gateway_ready_for(base_url: str) -> bool:
+def opencode_router_state() -> dict:
     try:
-        models_url = base_url.rstrip("/") + "/models"
-        with urllib.request.urlopen(models_url, timeout=2) as response:
+        payload = json.loads(OPENCODE_ROUTER_STATE_PATH.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def opencode_router_health(base_url: str) -> dict | None:
+    """Health payload of *our* router; None when something else owns the port."""
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/health", timeout=2) as response:
             payload = json.load(response)
-            return response.status == 200 and isinstance(payload.get("data"), list)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(payload, dict) and payload.get("service") == OPENCODE_ROUTER_SERVICE:
+        return payload
+    return None
+
+
+def opencode_router_pids() -> list[int]:
+    result = subprocess.run(
+        ["/usr/sbin/lsof", "-ti", f"tcp:{OPENCODE_ROUTER_PORT}", "-sTCP:LISTEN"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    pids = []
+    for line in result.stdout.split():
+        try:
+            pids.append(int(line))
+        except ValueError:
+            continue
+    return pids
+
+
+def stop_opencode_router() -> None:
+    for pid in opencode_router_pids():
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            continue
+    deadline = time.time() + 5
+    while time.time() < deadline and opencode_router_pids():
+        time.sleep(0.25)
+
+
+def start_opencode_router() -> bool:
+    """Start the router detached so it survives the launcher's exit."""
+    if not OPENCODE_ROUTER_MODULE.is_file():
         return False
-
-
-def require_opencode_gateway_for(provider: dict) -> None:
-    if not opencode_gateway_ready_for(provider["base_url"]):
-        raise RuntimeError(
-            f"Не найден OpenAI-compatible gateway OpenCode: {provider['base_url']}. "
-            "Запустите совместимый gateway из OpenCode."
+    try:
+        OPENCODE_ROUTER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = OPENCODE_ROUTER_LOG_PATH.open("a", encoding="utf-8")
+    except OSError:
+        log_handle = subprocess.DEVNULL
+    command = [
+        sys.executable or "python3",
+        str(OPENCODE_ROUTER_MODULE),
+        "serve",
+        "--host",
+        OPENCODE_ROUTER_HOST,
+        "--port",
+        str(OPENCODE_ROUTER_PORT),
+    ]
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(PROJECT_ROOT),
+            env=launch_environment(),
         )
+    except (OSError, ValueError):
+        if log_handle is not subprocess.DEVNULL:
+            log_handle.close()
+        return False
+    return True
+
+
+def ensure_opencode_router() -> tuple[str, str | None]:
+    """Run the OpenCode router and return its base url and access token.
+
+    Codex always talks to this single loopback endpoint; which upstream and
+    which credentials serve a model is decided per request, from the model list
+    OpenCode itself reports.
+    """
+    base_url = opencode_router_base()
+    expected_stamp = opencode_router_source_stamp()
+    for _ in range(2):
+        health = opencode_router_health(base_url)
+        token = opencode_router_state().get("token")
+        if health and isinstance(token, str) and token:
+            if health.get("stamp") == expected_stamp:
+                return base_url, token
+            # The daemon predates the current router source; restart it.
+        if health:
+            stop_opencode_router()
+        start_opencode_router()
+        deadline = time.time() + OPENCODE_ROUTER_READY_TIMEOUT
+        while time.time() < deadline:
+            health = opencode_router_health(base_url)
+            token = opencode_router_state().get("token")
+            if health and isinstance(token, str) and token:
+                if health.get("stamp") == expected_stamp:
+                    return base_url, token
+            time.sleep(0.25)
+    raise RuntimeError(
+        "Не удалось запустить локальный роутер OpenCode "
+        f"({base_url}). Смотрите лог: {OPENCODE_ROUTER_LOG_PATH}"
+    )
+
+
+def opencode_router_models(base_url: str, token: str | None) -> list[tuple[str, str, int | None]]:
+    """Models the router offers: (model id, display name, context window)."""
+    request = urllib.request.Request(base_url.rstrip("/") + "/v1/models")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.load(response)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
+        return []
+    models: list[tuple[str, str, int | None]] = []
+    for entry in payload.get("data") or []:
+        if not isinstance(entry, dict):
+            continue
+        model_id = str(entry.get("id") or "")
+        if not model_id:
+            continue
+        display_name = str(entry.get("name") or model_id)
+        context_window = entry.get("context_length")
+        models.append(
+            (
+                model_id,
+                display_name,
+                context_window if isinstance(context_window, int) and context_window > 0 else None,
+            )
+        )
+    return models
 
 
 def fetch_openrouter_free_models() -> list[tuple[str, str]]:
@@ -663,48 +801,134 @@ def fetch_openrouter_free_models() -> list[tuple[str, str]]:
         return fallback
 
 
-def fetch_opencode_models(base_url: str) -> list[tuple[str, str]]:
-    try:
-        models_url = base_url.rstrip("/") + "/models"
-        with urllib.request.urlopen(models_url, timeout=3) as response:
-            payload = json.load(response)
-        if not isinstance(payload.get("data"), list):
-            return []
-        models = []
-        for entry in payload["data"]:
-            if not isinstance(entry, dict):
-                continue
-            model_id = str(entry.get("id") or entry.get("name") or "")
-            if model_id:
-                models.append((model_id, entry.get("name") or model_id))
-        return models
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
-        return []
-
-
 def models_for(provider_key: str) -> list[tuple[str, str]]:
+    """Models for the providers that do not go through OpenCode."""
     if provider_key == "openrouter-free":
         return fetch_openrouter_free_models()
-    provider = opencode_provider(provider_key)
-    if provider:
-        # The model is selected later inside Codex, so when picking the
-        # starting model prefer what the live gateway actually serves.  Only
-        # fall back to the model list declared in opencode.jsonc (which can go
-        # stale) when the gateway does not answer.
-        models = fetch_opencode_models(provider["base_url"])
-        if not models:
-            models = provider.get("models") or []
-        return models
     return [("gpt-5.6-luna", "GPT-5.6 Luna — лимит подписки")]
 
 
+def model_catalog_path() -> Path:
+    override = os.environ.get(MODEL_CATALOG_ENV)
+    if override:
+        return Path(override).expanduser()
+    # Keep the catalog next to the config.toml the launcher rewrites: that is
+    # always the native ~/.codex home, even when a CODEX_HOME is exported by the
+    # caller (the app itself is launched without one).
+    return NATIVE_CONFIG_PATH.parent / MODEL_CATALOG_FILENAME
+
+
+def cached_model_messages() -> dict:
+    """Instructions Codex already caches for its own models.
+
+    Codex refuses catalog entries that carry no model instructions, and its own
+    prompt keeps approval/permission behaviour intact, so prefer it over the
+    built-in fallback text.
+    """
+    for path in dict.fromkeys(
+        (
+            model_catalog_path().parent / "models_cache.json",
+            NATIVE_CODEX_HOME / "models_cache.json",
+        )
+    ):
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for model in payload.get("models") or []:
+            if not isinstance(model, dict):
+                continue
+            messages = model.get("model_messages")
+            if isinstance(messages, dict) and messages.get("instructions_template"):
+                return messages
+    return {"instructions_template": FALLBACK_MODEL_INSTRUCTIONS}
+
+
+def catalog_model_entry(
+    model_id: str,
+    display_name: str,
+    priority: int,
+    messages: dict,
+    context_window: int | None = None,
+) -> dict:
+    """One Codex catalog entry.
+
+    Only the fields Codex requires are set; reasoning levels, tool modes and
+    Responses-lite flags stay unset so a third-party model keeps the exact
+    request shape Codex already uses for model slugs it does not know.
+    """
+    return {
+        "slug": model_id,
+        "display_name": display_name,
+        "description": display_name,
+        "supported_reasoning_levels": [],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": priority,
+        "availability_nux": None,
+        "upgrade": None,
+        "support_verbosity": False,
+        "default_verbosity": None,
+        "apply_patch_tool_type": None,
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "experimental_supported_tools": [],
+        "context_window": context_window or DEFAULT_CATALOG_CONTEXT_WINDOW,
+        "model_messages": messages,
+    }
+
+
+def build_model_catalog(models: list[tuple[str, str, int | None]]) -> dict:
+    messages = cached_model_messages()
+    return {
+        "models": [
+            catalog_model_entry(model_id, display_name, index + 1, messages, context_window)
+            for index, (model_id, display_name, context_window) in enumerate(models)
+        ]
+    }
+
+
+def sync_model_catalog(models: list[tuple[str, str, int | None]]) -> Path | None:
+    """Refresh the catalog Codex reads for the selected provider.
+
+    Returns the written path, or None when there are no models to write or the
+    file cannot be written (Codex then falls back to its bundled list).
+    """
+    if not models:
+        return None
+    path = model_catalog_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(build_model_catalog(models), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        return None
+    return path
+
+
 def provider_rows() -> list[tuple[str, str]]:
-    rows = [("openai", "Codex"), ("openrouter-free", "OpenRouter")]
-    rows.extend(
-        (provider["key"], provider["name"])
-        for provider in opencode_provider_configs()
-    )
-    return rows
+    """The three entries the launcher offers.
+
+    Codex is the bundled subscription entry, OpenRouter brings its own free
+    models, and OpenCode mirrors everything OpenCode itself serves.
+    """
+    return [
+        ("openai", "Codex"),
+        ("openrouter-free", "OpenRouter"),
+        (OPENCODE_PROVIDER_KEY, OPENCODE_PROVIDER_NAME),
+    ]
+
+
+def available_models_for(provider_key: str, opencode: dict | None = None) -> list[str]:
+    if opencode:
+        return [model_id for model_id, _, _ in opencode["models"]]
+    return [model_id for model_id, _ in models_for(provider_key)]
 
 
 def list_provider_rows() -> None:
@@ -721,27 +945,49 @@ def switch_provider(provider_key: str, model: str | None = None) -> None:
     previous_model = root_value(original, "model")
     remember_model(previous_provider, previous_model)
 
-    selected_opencode = opencode_provider(provider_key)
+    opencode: dict | None = None
     if provider_key == "openai":
         provider = "openai"
     elif provider_key == "openrouter-free":
         provider = "openrouter"
-    elif selected_opencode:
-        provider = provider_key
+    elif provider_key == OPENCODE_PROVIDER_KEY:
+        # Codex gets one provider that mirrors OpenCode.  Everything the router
+        # needs (upstream endpoint, credentials, per-model request extras) comes
+        # from OpenCode's own model list, so Codex and OpenCode stay in sync.
+        ensure_opencode_service()
+        base_url, token = ensure_opencode_router()
+        models = opencode_router_models(base_url, token)
+        if not models:
+            raise RuntimeError(
+                "OpenCode не отдал список моделей. Запустите OpenCode "
+                f"и повторите (лог роутера: {OPENCODE_ROUTER_LOG_PATH})."
+            )
+        opencode = {
+            "key": OPENCODE_PROVIDER_KEY,
+            "name": OPENCODE_PROVIDER_NAME,
+            "base_url": base_url.rstrip("/") + "/v1",
+            "api_key": token,
+            "models": models,
+        }
+        provider = OPENCODE_PROVIDER_KEY
     else:
         raise RuntimeError("Неизвестный провайдер.")
 
     # The real model is chosen later inside the Codex interface.  The launcher
     # only plants a valid starting model so Codex opens on the requested
     # provider instead of silently falling back to its bundled OpenAI default.
-    selected_model = model or default_model_for(provider_key, original)
+    available = available_models_for(provider_key, opencode)
+    selected_model = model or default_model_for(provider_key, original, available)
 
-    if selected_opencode:
-        require_opencode_gateway_for(selected_opencode)
+    # Codex reads the catalog once at startup, so refresh it before relaunching.
+    catalog = sync_model_catalog(opencode["models"]) if opencode else None
     stop_apps(["ChatGPT"])
-    updated = ensure_external_provider_tables(original)
+    updated = ensure_external_provider_tables(original, opencode)
     updated = set_root_key(updated, "model_provider", provider)
     updated = set_root_key(updated, "model", selected_model)
+    updated = remove_root_key(updated, MODEL_CATALOG_ROOT_KEY)
+    if catalog:
+        updated = set_root_key(updated, MODEL_CATALOG_ROOT_KEY, str(catalog))
     backup_and_write(config, updated)
     remember_model(provider, selected_model)
     open_apps(["ChatGPT"])
@@ -973,6 +1219,7 @@ def select_account(account_id: str) -> None:
     updated = ensure_external_provider_tables(original)
     updated = set_root_key(updated, "model_provider", "openai")
     updated = set_root_key(updated, "model", "gpt-5.6-luna")
+    updated = remove_root_key(updated, MODEL_CATALOG_ROOT_KEY)
     if updated != original:
         backup_and_write(NATIVE_CONFIG_PATH, updated)
     open_apps(["ChatGPT"])
