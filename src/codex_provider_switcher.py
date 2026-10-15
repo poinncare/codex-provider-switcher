@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -48,6 +51,17 @@ refresh_interval_ms = 0
 """
 
 OPENCODE_CONFIG_NAMES = ("opencode.json", "opencode.jsonc")
+# Providers that must never appear as separate launcher entries.  Copilot is
+# not used by this project, so a provider that identifies itself as Copilot is
+# skipped during discovery.  Copilot models exposed by another provider (for
+# example through the shared OpenCode gateway) are left untouched.
+EXCLUDED_OPENCODE_PROVIDER_MARKER = "copilot"
+# Provider ids owned by the launcher.  These are the only sections the launcher
+# creates, refreshes and removes in Codex config.toml.
+MANAGED_PROVIDER_KEYS = ("openrouter",)
+MANAGED_PROVIDER_PREFIX = "opencode-"
+# Comment written above the launcher-managed provider section.
+EXTERNAL_PROVIDERS_MARKER = "# External model providers"
 
 
 def run_json(command: list[str]) -> dict:
@@ -62,6 +76,20 @@ def orca_command() -> str | None:
         shutil.which("orca"),
         "/Applications/Orca.app/Contents/Resources/bin/orca",
         "/usr/local/bin/orca",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def codex_command() -> str | None:
+    candidates = [
+        os.environ.get("CODEX_CLI_COMMAND"),
+        shutil.which("codex"),
+        "/opt/homebrew/bin/codex",
+        "/usr/local/bin/codex",
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
     ]
     for candidate in candidates:
         if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
@@ -117,6 +145,16 @@ def opencode_provider_auth(provider: dict) -> str | None:
     return None
 
 
+def is_excluded_provider(provider_id: str, provider_name: str) -> bool:
+    haystack = f"{provider_id} {provider_name}".lower()
+    return EXCLUDED_OPENCODE_PROVIDER_MARKER in haystack
+
+
+def is_managed_provider_key(key: str) -> bool:
+    """True when the launcher owns this [model_providers.*] section."""
+    return key in MANAGED_PROVIDER_KEYS or key.startswith(MANAGED_PROVIDER_PREFIX)
+
+
 def opencode_provider_configs() -> list[dict]:
     for path in jsonc_paths():
         if not path.is_file():
@@ -136,6 +174,8 @@ def opencode_provider_configs() -> list[dict]:
             base_url = options.get("baseURL") or options.get("base_url") or provider.get("baseURL")
             if not base_url:
                 continue
+            if is_excluded_provider(str(provider_id), str(provider.get("name") or provider_id)):
+                continue
             models = provider.get("models") or {}
             model_rows = []
             if isinstance(models, dict):
@@ -145,12 +185,12 @@ def opencode_provider_configs() -> list[dict]:
             discovered.append(
                 {
                     "id": str(provider_id),
-                    "key": "opencode-" + re.sub(r"[^A-Za-z0-9_-]", "-", str(provider_id)),
+                    "key": MANAGED_PROVIDER_PREFIX
+                    + re.sub(r"[^A-Za-z0-9_-]", "-", str(provider_id)),
                     "name": str(provider.get("name") or provider_id),
                     "base_url": str(base_url),
                     "models": model_rows,
                     "api_key": opencode_provider_auth(provider),
-                    "_options": options,
                 }
             )
         return discovered
@@ -161,23 +201,32 @@ def opencode_provider(provider_key: str) -> dict | None:
     return next((item for item in opencode_provider_configs() if item["key"] == provider_key), None)
 
 
-def local_system_account() -> dict:
-    auth_path = NATIVE_AUTH_PATH
+def account_from_auth(auth_path: Path) -> dict:
     try:
         data = json.loads(auth_path.read_text(encoding="utf-8"))
         tokens = data.get("tokens", {})
+        if not isinstance(tokens, dict):
+            return {}
         account_id = tokens.get("account_id")
         access_token = tokens.get("access_token", "")
+        if not isinstance(access_token, str):
+            return {}
         payload_part = access_token.split(".")[1]
         payload_part += "=" * (-len(payload_part) % 4)
-        payload = json.loads(__import__("base64").urlsafe_b64decode(payload_part))
+        payload = json.loads(base64.urlsafe_b64decode(payload_part))
         profile = payload.get("https://api.openai.com/profile", {})
+        if not isinstance(profile, dict):
+            profile = {}
         email = profile.get("email") or payload.get("email")
         if account_id and email:
             return {"providerAccountId": account_id, "email": email, "authKind": "oauth"}
     except (OSError, IndexError, KeyError, ValueError, json.JSONDecodeError):
         pass
     return {}
+
+
+def local_system_account() -> dict:
+    return account_from_auth(NATIVE_AUTH_PATH)
 
 
 def auth_account_id(path: Path = NATIVE_AUTH_PATH) -> str | None:
@@ -258,13 +307,13 @@ def orca_accounts() -> dict:
         return run_json([command, "account", "list", "--json"]).get("codex", {})
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         return {
-            "accounts": managed_accounts(),
-            "activeAccountId": active_account_id(),
+            "accounts": stored_managed_accounts(),
+            "activeAccountId": stored_active_account_id(),
             "systemDefault": local_system_account(),
         }
 
 
-def managed_accounts() -> list[dict]:
+def stored_managed_accounts() -> list[dict]:
     for path in ORCA_DATA_PATHS:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -273,18 +322,30 @@ def managed_accounts() -> list[dict]:
                 return accounts
         except (OSError, json.JSONDecodeError):
             pass
-    return list(orca_accounts().get("accounts", []))
+    return []
 
 
-def active_account_id() -> str | None:
+def managed_accounts() -> list[dict]:
+    accounts = stored_managed_accounts()
+    return accounts if accounts else list(orca_accounts().get("accounts", []))
+
+
+def stored_active_account_id() -> str | None:
     for path in ORCA_DATA_PATHS:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             active = data.get("settings", {}).get("activeCodexManagedAccountId")
             if active:
-                return active
+                return str(active)
         except (OSError, json.JSONDecodeError):
             pass
+    return None
+
+
+def active_account_id() -> str | None:
+    stored_active = stored_active_account_id()
+    if stored_active:
+        return stored_active
     try:
         return orca_accounts().get("activeAccountId")
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -359,14 +420,16 @@ def default_model_for(provider_key: str, current_config: str) -> str:
     current_model = root_value(current_config, "model")
     if current_provider == provider and current_model:
         return current_model
+    # The model is picked later inside the Codex interface, so the switcher
+    # only needs a valid starting point.  Prefer whatever the provider
+    # currently advertises instead of a hard-coded list that goes stale.
+    available = models_for(provider_key)
+    if available:
+        return available[0][0]
     state_model = load_switcher_state().get("last_models", {}).get(provider)
     if state_model:
         return state_model
-    return {
-        "openrouter": "nvidia/nemotron-3.5-lightning:free",
-        "opencode-copilot": "gh/gpt-5-mini",
-        "opencode-kiro": "kiro/claude-haiku-4.5",
-    }.get(provider, "gpt-5.6-luna")
+    return "gpt-5.6-luna"
 
 
 def toml_string(value: str) -> str:
@@ -378,61 +441,59 @@ def provider_tables() -> str:
         OPENROUTER_PROVIDER_TABLE.format(token_helper=toml_string(str(OPENROUTER_TOKEN_HELPER)))
     ]
     for provider in opencode_provider_configs():
-        options = (provider.get("_options") or {})
-        wire_api = options.get("wireApi") or options.get("wire_api") or "chat"
+        # Codex only supports the Responses wire API; the legacy "chat" value is
+        # rejected outright.  OpenCode gateways speak the OpenAI-compatible
+        # Responses API, so every generated provider uses it.
         lines = [
             f"[model_providers.{provider['key']}]",
-            f"name = {toml_string('OpenCode · ' + provider['name'])}",
+            f"name = {toml_string(provider['name'])}",
             f"base_url = {toml_string(provider['base_url'])}",
-            f'wire_api = {toml_string(wire_api)}',
+            'wire_api = "responses"',
         ]
         api_key = provider.get("api_key")
         if api_key:
-            lines.append("")
-            lines.append(f"[model_providers.{provider['key']}.auth]")
-            lines.append(f"api_key = {toml_string(api_key)}")
+            # Codex's ModelProviderInfo denies unknown fields inside [.auth], so
+            # a static bearer key belongs at provider level.
+            lines.append(f"experimental_bearer_token = {toml_string(api_key)}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
 
+def strip_managed_provider_tables(text: str) -> str:
+    """Remove every launcher-owned [model_providers.*] section and its marker.
+
+    Managed sections can go stale between releases (renamed providers, removed
+    entries, changed wire_api).  Dropping them wholesale lets
+    ensure_external_provider_tables rewrite one canonical set instead of
+    patching whatever happens to be present.
+    """
+    kept = []
+    skipping = False
+    for line in text.splitlines():
+        header = re.match(r"^\s*\[\[?\s*([^\[\]]+?)\s*\]\]?", line)
+        if header:
+            parts = header.group(1).strip().split(".")
+            skipping = (
+                len(parts) >= 2
+                and parts[0] == "model_providers"
+                and is_managed_provider_key(parts[1])
+            )
+        if skipping:
+            continue
+        if line.strip() == EXTERNAL_PROVIDERS_MARKER:
+            continue
+        kept.append(line)
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return result + "\n" if result else ""
+
+
 def ensure_external_provider_tables(text: str) -> str:
+    stripped = strip_managed_provider_tables(text).rstrip()
     tables = provider_tables()
-    token_command = f"command = {toml_string(str(OPENROUTER_TOKEN_HELPER))}"
-    if "[model_providers.openrouter]" in text:
-        text = re.sub(
-            r"(?ms)(\[model_providers\.openrouter\.auth\].*?)(?=\n\s*\[|\Z)",
-            lambda match: re.sub(
-                r"(?m)^\s*command\s*=.*$",
-                token_command,
-                match.group(1),
-                count=1,
-            ),
-            text,
-            count=1,
-        )
-    else:
-        text = text.rstrip() + "\n\n# External model providers\n" + tables
-    for provider in opencode_provider_configs():
-        marker = f"[model_providers.{provider['key']}]"
-        if marker not in text:
-            text = text.rstrip() + "\n\n" + provider_block_for(tables, marker)
-    return text.rstrip() + "\n"
-
-
-def provider_block_for(tables: str, marker: str) -> str:
-    paragraphs = tables.split("\n\n")
-    key = marker[len("[model_providers.") : -1]
-    base = "[model_providers." + key
-    for index, block in enumerate(paragraphs):
-        if block.startswith(base + "]") or block.startswith(base + "."):
-            chunk = [block]
-            for following in paragraphs[index + 1 :]:
-                belongs = following.startswith(base + "]") or following.startswith(base + ".")
-                if following.startswith("[model_providers.") and not belongs:
-                    break
-                chunk.append(following)
-            return "\n\n".join(chunk)
-    return ""
+    if not tables:
+        return stripped + "\n" if stripped else ""
+    prefix = stripped + "\n\n" if stripped else ""
+    return f"{prefix}{EXTERNAL_PROVIDERS_MARKER}\n{tables}\n"
 
 
 def backup_and_write(path: Path, text: str) -> Path:
@@ -626,12 +687,13 @@ def models_for(provider_key: str) -> list[tuple[str, str]]:
         return fetch_openrouter_free_models()
     provider = opencode_provider(provider_key)
     if provider:
-        # Prefer the curated models declared in opencode.jsonc (the user's
-        # free list).  If none are declared, fall back to whatever the live
-        # OpenCode gateway exposes so the provider still works.
-        models = provider.get("models") or []
+        # The model is selected later inside Codex, so when picking the
+        # starting model prefer what the live gateway actually serves.  Only
+        # fall back to the model list declared in opencode.jsonc (which can go
+        # stale) when the gateway does not answer.
+        models = fetch_opencode_models(provider["base_url"])
         if not models:
-            models = fetch_opencode_models(provider["base_url"])
+            models = provider.get("models") or []
         return models
     return [("gpt-5.6-luna", "GPT-5.6 Luna — лимит подписки")]
 
@@ -639,7 +701,7 @@ def models_for(provider_key: str) -> list[tuple[str, str]]:
 def provider_rows() -> list[tuple[str, str]]:
     rows = [("openai", "Codex"), ("openrouter-free", "OpenRouter")]
     rows.extend(
-        (provider["key"], f"OpenCode · {provider['name']}")
+        (provider["key"], provider["name"])
         for provider in opencode_provider_configs()
     )
     return rows
@@ -650,7 +712,7 @@ def list_provider_rows() -> None:
         print(f"{provider_key}\t{display_name}")
 
 
-def switch_provider(provider_key: str, model: str | None) -> None:
+def switch_provider(provider_key: str, model: str | None = None) -> None:
     config = NATIVE_CONFIG_PATH
     if not config.is_file():
         raise RuntimeError("Не найден штатный конфиг Codex в ~/.codex.")
@@ -659,16 +721,21 @@ def switch_provider(provider_key: str, model: str | None) -> None:
     previous_model = root_value(original, "model")
     remember_model(previous_provider, previous_model)
 
+    selected_opencode = opencode_provider(provider_key)
     if provider_key == "openai":
-        provider, selected_model = "openai", "gpt-5.6-luna"
+        provider = "openai"
     elif provider_key == "openrouter-free":
-        provider, selected_model = "openrouter", model or default_model_for(provider_key, original)
-    elif opencode_provider(provider_key):
-        provider, selected_model = provider_key, model or default_model_for(provider_key, original)
+        provider = "openrouter"
+    elif selected_opencode:
+        provider = provider_key
     else:
         raise RuntimeError("Неизвестный провайдер.")
 
-    selected_opencode = opencode_provider(provider_key)
+    # The real model is chosen later inside the Codex interface.  The launcher
+    # only plants a valid starting model so Codex opens on the requested
+    # provider instead of silently falling back to its bundled OpenAI default.
+    selected_model = model or default_model_for(provider_key, original)
+
     if selected_opencode:
         require_opencode_gateway_for(selected_opencode)
     stop_apps(["ChatGPT"])
@@ -678,11 +745,6 @@ def switch_provider(provider_key: str, model: str | None) -> None:
     backup_and_write(config, updated)
     remember_model(provider, selected_model)
     open_apps(["ChatGPT"])
-
-
-def list_model_rows(provider_key: str) -> None:
-    for model_id, display_name in models_for(provider_key):
-        print(f"{model_id}\t{display_name}")
 
 
 def list_account_rows() -> None:
@@ -713,49 +775,133 @@ def register_existing_system_account() -> None:
     if source_account_id and source_account_id != provider_id:
         raise RuntimeError("Локальная авторизация Codex не совпадает со второй сессией Orca.")
 
-    account_id = provider_id
-    target_home = ACCOUNTS_ROOT / account_id / "home"
+    register_codex_home(
+        NATIVE_CODEX_HOME,
+        expected_provider_id=provider_id,
+        workspace_label=system_default.get("workspaceLabel"),
+    )
+
+
+def register_codex_home(
+    source_home: Path,
+    expected_provider_id: str | None = None,
+    workspace_label: str | None = None,
+) -> dict:
+    """Store a freshly authenticated Codex home without changing the active account."""
+    source_home = Path(source_home)
+    source_auth = source_home / "auth.json"
+    identity = account_from_auth(source_auth)
+    provider_id = str(identity.get("providerAccountId") or "")
+    email = identity.get("email")
+    if not provider_id or not email:
+        raise RuntimeError("После входа не удалось определить аккаунт Codex из auth.json.")
+    if expected_provider_id and provider_id != str(expected_provider_id):
+        raise RuntimeError("Локальная авторизация Codex не совпадает с ожидаемым аккаунтом.")
+
+    existing = next(
+        (
+            account
+            for account in managed_accounts()
+            if provider_id
+            in {
+                str(account.get("id") or ""),
+                str(account.get("providerAccountId") or ""),
+            }
+        ),
+        None,
+    )
+    now = int(time.time() * 1000)
+    account_id = str((existing or {}).get("id") or provider_id)
+    target_home = Path(
+        (existing or {}).get("managedHomePath") or ACCOUNTS_ROOT / account_id / "home"
+    )
     target_home.mkdir(parents=True, exist_ok=True)
     target_auth = target_home / "auth.json"
-    shutil.copy2(source_auth, target_auth)
+    if source_auth.resolve() != target_auth.resolve():
+        backup_and_copy(source_auth, target_auth)
     target_auth.chmod(0o600)
     (target_home / ".orca-managed-home").write_text(account_id, encoding="utf-8")
 
-    source_config = config_for_account(active_account_id())
-    target_config = target_home / "config.toml"
-    config_text = source_config.read_text(encoding="utf-8")
-    config_text = config_text.replace(str(source_config.parent), str(target_home))
-    target_config.write_text(config_text, encoding="utf-8")
+    active_id = stored_active_account_id()
+    try:
+        source_config = config_for_account(active_id)
+    except RuntimeError:
+        source_config = NATIVE_CONFIG_PATH if NATIVE_CONFIG_PATH.is_file() else None
+    if source_config and source_config.is_file():
+        target_config = target_home / "config.toml"
+        if source_config.resolve() != target_config.resolve():
+            config_text = source_config.read_text(encoding="utf-8")
+            config_text = config_text.replace(str(source_config.parent), str(target_home))
+            if target_config.is_file():
+                backup_and_write(target_config, config_text)
+            else:
+                target_config.write_text(config_text, encoding="utf-8")
 
-    now = int(time.time() * 1000)
-    account = {
-        "id": account_id,
-        "email": email,
-        "managedHomePath": str(target_home),
-        "managedHomeRuntime": "host",
-        "wslDistro": None,
-        "wslLinuxHomePath": None,
-        "providerAccountId": provider_id,
-        "workspaceLabel": system_default.get("workspaceLabel"),
-        "workspaceAccountId": provider_id,
-        "createdAt": now,
-        "updatedAt": now,
-        "lastAuthenticatedAt": now,
-    }
+    account = dict(existing or {})
+    account.update(
+        {
+            "id": account_id,
+            "email": email,
+            "managedHomePath": str(target_home),
+            "managedHomeRuntime": "host",
+            "wslDistro": account.get("wslDistro"),
+            "wslLinuxHomePath": account.get("wslLinuxHomePath"),
+            "providerAccountId": provider_id,
+            "workspaceAccountId": account.get("workspaceAccountId") or provider_id,
+            "workspaceLabel": account.get("workspaceLabel") or workspace_label,
+            "createdAt": account.get("createdAt") or now,
+            "updatedAt": now,
+            "lastAuthenticatedAt": now,
+        }
+    )
 
     def add_account(data: dict) -> dict:
         settings = data.setdefault("settings", {})
+        if not isinstance(settings, dict):
+            settings = {}
+            data["settings"] = settings
         accounts = settings.setdefault("codexManagedAccounts", [])
-        if not any(item.get("id") == account_id for item in accounts):
+        if not isinstance(accounts, list):
+            accounts = []
+            settings["codexManagedAccounts"] = accounts
+        match_index = next(
+            (
+                index
+                for index, item in enumerate(accounts)
+                if isinstance(item, dict)
+                and provider_id
+                in {
+                    str(item.get("id") or ""),
+                    str(item.get("providerAccountId") or ""),
+                }
+            ),
+            None,
+        )
+        if match_index is None:
             accounts.append(account)
-        settings.setdefault("activeCodexManagedAccountId", active_account_id())
+        else:
+            accounts[match_index] = account
+        settings.setdefault("activeCodexManagedAccountId", active_id)
         selection = settings.setdefault("activeCodexManagedAccountIdsByRuntime", {})
-        selection.setdefault("host", active_account_id())
+        if not isinstance(selection, dict):
+            selection = {}
+            settings["activeCodexManagedAccountIdsByRuntime"] = selection
+        selection.setdefault("host", active_id)
         selection.setdefault("wsl", {})
         return data
 
-    for path in ORCA_DATA_PATHS:
-        replace_json_with_backup(path, add_account)
+    existing_paths = [path for path in ORCA_DATA_PATHS if path.is_file()]
+    if existing_paths:
+        for path in existing_paths:
+            replace_json_with_backup(path, add_account)
+    else:
+        path = ORCA_DATA_PATHS[0]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(add_account({}), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return account
 
 
 def prepare_accounts() -> None:
@@ -767,15 +913,40 @@ def prepare_accounts() -> None:
 
 
 def add_account() -> None:
-    command_path = orca_command()
-    if not command_path:
-        raise RuntimeError("Не найден Orca CLI. Установите Orca или добавьте команду orca в PATH.")
-    command = f"{command_path} account add --agent codex"
+    command = " ".join(
+        [
+            shlex.quote(str(Path(sys.executable).resolve())),
+            shlex.quote(str(Path(__file__).resolve())),
+            "login-account",
+        ]
+    )
     script = (
         'tell application "Terminal" to activate\n'
         f'tell application "Terminal" to do script {json.dumps(command)}'
     )
     subprocess.run(["/usr/bin/osascript", "-e", script], check=True)
+
+
+def login_account() -> None:
+    command_path = codex_command()
+    if not command_path:
+        raise RuntimeError("Не найден Codex CLI. Установите Codex или добавьте команду codex в PATH.")
+
+    temporary_home = Path(tempfile.mkdtemp(prefix="codex-provider-switcher-login-"))
+    try:
+        environment = launch_environment()
+        environment["CODEX_HOME"] = str(temporary_home)
+        result = subprocess.run(
+            [command_path, "login", "-c", 'cli_auth_credentials_store="file"'],
+            env=environment,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Вход Codex не завершён (код {result.returncode}).")
+        account = register_codex_home(temporary_home)
+        print(f"Аккаунт Codex добавлен: {account['email']}")
+    finally:
+        shutil.rmtree(temporary_home, ignore_errors=True)
 
 
 def replace_json_with_backup(path: Path, transform) -> None:
@@ -809,13 +980,15 @@ def select_account(account_id: str) -> None:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("commands: list-providers, list-models, switch-provider, list-accounts, switch-account, add-account", file=sys.stderr)
+        print(
+            "commands: list-providers, switch-provider, list-accounts, "
+            "switch-account, add-account, login-account",
+            file=sys.stderr,
+        )
         return 2
     command = sys.argv[1]
     if command == "list-providers" and len(sys.argv) == 2:
         list_provider_rows()
-    elif command == "list-models" and len(sys.argv) == 3:
-        list_model_rows(sys.argv[2])
     elif command == "switch-provider" and len(sys.argv) in (3, 4):
         switch_provider(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None)
     elif command == "list-accounts" and len(sys.argv) == 2:
@@ -826,6 +999,8 @@ def main() -> int:
         select_account(sys.argv[2])
     elif command == "add-account" and len(sys.argv) == 2:
         add_account()
+    elif command == "login-account" and len(sys.argv) == 2:
+        login_account()
     else:
         print("Неверная команда или параметры.", file=sys.stderr)
         return 2

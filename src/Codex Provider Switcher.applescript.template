@@ -15,10 +15,18 @@ on chooseCodexAccount()
         set fields to my splitText(rawRow as text, tab)
         if (count of fields) ≥ 2 then set end of displayRows to item 2 of fields
     end repeat
-    if (count of displayRows) is less than 2 then error "Не удалось найти авторизованные подписки Codex."
-    set picked to choose from list displayRows with title "Codex" with prompt "Выберите аккаунт:" OK button name "Войти" cancel button name "Отмена"
+    set addLabel to "Добавить аккаунт…"
+    set menuRows to displayRows
+    set end of menuRows to addLabel
+    if (count of menuRows) is 0 then error "Не удалось найти авторизованные подписки Codex."
+    set picked to choose from list menuRows with title "Codex" with prompt "Выберите аккаунт:" OK button name "Войти" cancel button name "Отмена"
     if picked is false then return
     set pickedLabel to item 1 of picked
+    if pickedLabel is addLabel then
+        do shell script helper & " add-account"
+        display dialog "Открылся Terminal. Завершите вход в браузере, затем снова откройте Codex." with title "Добавление аккаунта" buttons {"OK"} default button "OK"
+        return
+    end if
     repeat with rawRow in rawRows
         set fields to my splitText(rawRow as text, tab)
         if (count of fields) ≥ 2 and (item 2 of fields) is pickedLabel then
@@ -27,29 +35,6 @@ on chooseCodexAccount()
         end if
     end repeat
 end chooseCodexAccount
-
-on chooseModel(providerKey)
-    set rawRows to paragraphs of (do shell script helper & " list-models " & quoted form of providerKey)
-    set displayRows to {}
-    set keyRows to {}
-    repeat with rawRow in rawRows
-        set fields to my splitText(rawRow as text, tab)
-        if (count of fields) ≥ 2 then
-            set end of displayRows to item 2 of fields
-            set end of keyRows to item 1 of fields
-        end if
-    end repeat
-    if (count of displayRows) is 0 then error "Для выбранного провайдера не найдены модели. Убедитесь, что gateway запущен и доступен."
-    set picked to choose from list displayRows with title "Codex" with prompt "Выберите модель:" OK button name "Выбрать" cancel button name "Отмена"
-    if picked is false then return
-    set pickedLabel to item 1 of picked
-    repeat with i from 1 to count of displayRows
-        if item i of displayRows is pickedLabel then
-            do shell script helper & " switch-provider " & quoted form of providerKey & " " & quoted form of (item i of keyRows)
-            exit repeat
-        end if
-    end repeat
-end chooseModel
 
 on chooseProvider()
     set rawRows to paragraphs of (do shell script helper & " list-providers")
@@ -69,7 +54,7 @@ on chooseProvider()
             if providerKey is "openai" then
                 my chooseCodexAccount()
             else
-                my chooseModel(providerKey)
+                do shell script helper & " switch-provider " & quoted form of providerKey
             end if
             exit repeat
         end if
